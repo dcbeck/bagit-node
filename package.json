@@ -1,0 +1,48 @@
+{
+  "name": "bagit-node",
+  "version": "1.0.0",
+  "description": "TypeScript BagIt library with ESM, CommonJS and streaming ZIP64 export",
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "test:interop": "npm run build && node --test test/interop/*.test.mjs",
+    "test:upstream": "npm run build && python3 test/interop/run_upstream.py",
+    "test:stress": "npm run build && node --test test/stress/*.test.mjs",
+    "test:all": "npm test && npm run test:upstream && npm run test:interop && npm run test:stress",
+    "prepack": "npm run build"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/yazl": "^3.3.1",
+    "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "yazl": "^3.3.1"
+  }
+}

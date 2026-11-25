@@ -1,0 +1,6 @@
+BagIt behavior and compatibility tests are based on LibraryOfCongress/bagit-python:
+https://github.com/LibraryOfCongress/bagit-python
+Reference commit: 4bd2713cedbe1f8e634567c20ef0dded9622011d
+Upstream identifies its Python code as public domain.
+The test/vendor directory contains unmodified reference material for testing only
+and is excluded from npm releases. See test/vendor/bagit-python/README.md.
