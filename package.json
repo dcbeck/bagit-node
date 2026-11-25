@@ -1,6 +1,6 @@
 {
   "name": "bagit-node",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "TypeScript BagIt library with ESM, CommonJS and streaming ZIP64 export",
   "type": "module",
   "main": "./dist/cjs/index.js",
@@ -21,6 +21,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "NOTICE"
   ],

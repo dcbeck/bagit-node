@@ -17,9 +17,11 @@ export interface BagZipOptions {
   checksums?: readonly string[];
   /** An optional directory containing the entire bag inside the archive. Default: archive root. */
   bagName?: string;
+  /** Lazy custom tag files, with paths relative to the bag root. Use fresh iterables and sources for retries. */
+  tagFiles?: Iterable<BagZipEntry> | AsyncIterable<BagZipEntry>;
   /** Deflate level 0–9; default 6. */
   compressionLevel?: number;
-  /** Temporary directory for manifests; payloads are never staged. */
+  /** Temporary directory for payload manifests; payloads and custom tag files are never staged. */
   tempDirectory?: string;
   signal?: AbortSignal;
   /** Fixed ZIP modification time for reproducible archives. */
@@ -36,7 +38,7 @@ export interface BagZipProgress {
 }
 export interface BagZipResult { bytesWritten: bigint; payloadBytes: bigint; payloadFiles: number; bagInfo: BagInfo; }
 
-/** Sources are opened lazily, one at a time. Paths are relative to the payload, without a data/ prefix. */
+/** Sources are opened lazily, one at a time. Payload paths are relative to data/; tagFiles paths are relative to the bag root. */
 export interface BagZipEntry {
   path: string;
   /** Preserve an empty directory. Its open() function is ignored. */
@@ -63,6 +65,28 @@ function validatePayloadPath(path: string): void {
   validateEntryPath(path.replace(/[\r\n]/g, '_'));
   if (/%0[ad]/i.test(path)) throw new BagError(`Ambiguous BagIt filename contains a literal encoded newline: ${path}`);
   if (/\s$/.test(encodeFilename(path))) throw new BagError(`BagIt cannot represent trailing whitespace unambiguously: ${JSON.stringify(path)}`);
+}
+
+function entryRegistry(kind: string, reservedFiles: readonly string[] = []): (entry: BagZipEntry) => void {
+  const seen = new Map<string, string>();
+  const directories = new Set<string>();
+  const files = new Set(reservedFiles);
+  return entry => {
+    validatePayloadPath(entry.path);
+    const normalized = normalizeUnicode(entry.path);
+    const previous = seen.get(normalized);
+    if (previous !== undefined) throw new FileNormalizationConflict(entry.path, previous);
+    if (files.has(normalized) || (!entry.directory && directories.has(normalized))) throw new BagError(`Conflicting ${kind} file and directory: ${entry.path}`);
+    const parts = normalized.split('/');
+    for (let i = 1; i < parts.length; i++) {
+      const parent = parts.slice(0, i).join('/');
+      if (files.has(parent)) throw new BagError(`Conflicting ${kind} paths: ${parent} and ${entry.path}`);
+      directories.add(parent);
+    }
+    seen.set(normalized, entry.path);
+    if (entry.directory) directories.add(normalized);
+    else files.add(normalized);
+  };
 }
 
 async function* folderEntries(directory: string, options: BagZipOptions): AsyncGenerator<BagZipEntry> {
@@ -172,6 +196,34 @@ async function* archiveContent(entries: AsyncIterable<BagZipEntry> | Iterable<Ba
     zip.addEmptyDirectory(name, { mtime: options.mtime ?? mtime ?? new Date(), mode });
   }
 
+  async function addSource(entry: BagZipEntry, name: string): Promise<{ bytes: bigint; hashes: Checksums }> {
+    const hashers = getHashers(algorithms);
+    let bytes = 0n;
+    async function* hashed(): AsyncGenerator<Uint8Array> {
+      signal.throwIfAborted();
+      const source = await entry.open();
+      const destroy = (): void => {
+        if (source instanceof Readable) source.destroy();
+      };
+      signal.addEventListener('abort', destroy, { once: true });
+      try {
+        signal.throwIfAborted();
+        for await (const chunk of source) {
+          signal.throwIfAborted();
+          if (!(chunk instanceof Uint8Array)) throw new TypeError('ZIP sources must produce Uint8Array or Buffer chunks');
+          bytes += BigInt(chunk.length);
+          for (const h of Object.values(hashers)) h.update(chunk);
+          yield chunk;
+        }
+      } finally {
+        signal.removeEventListener('abort', destroy);
+        destroy();
+      }
+    }
+    await addEntry(name, hashed(), entry.mtime, entry.mode);
+    return { bytes, hashes: Object.fromEntries(Object.entries(hashers).map(([a, h]) => [a, h.digest('hex')])) };
+  }
+
   const produce = async (): Promise<Omit<BagZipResult, 'bytesWritten'>> => {
     const manifests = new Map<string, { path: string; handle: FileHandle }>();
     for (const a of algorithms) {
@@ -181,55 +233,40 @@ async function* archiveContent(entries: AsyncIterable<BagZipEntry> | Iterable<Ba
       manifests.set(a, { path, handle });
     }
     const prefix = options.bagName ? `${options.bagName}/` : '';
-    const seen = new Map<string, string>();
-    const directories = new Set<string>();
-    const files = new Set<string>();
+    const registerPayload = entryRegistry('payload');
     let totalBytes = 0n;
     let totalFiles = 0;
     addDirectory(`${prefix}data/`);
     for await (const entry of entries) {
       signal.throwIfAborted();
-      validatePayloadPath(entry.path);
-      const normalized = normalizeUnicode(entry.path);
-      const previous = seen.get(normalized);
-      if (previous !== undefined) throw new FileNormalizationConflict(entry.path, previous);
-      if (!entry.directory && directories.has(normalized)) throw new BagError(`Conflicting payload file and directory: ${entry.path}`);
-      const parts = normalized.split('/');
-      for (let i = 1; i < parts.length; i++) {
-        const parent = parts.slice(0, i).join('/');
-        if (files.has(parent)) throw new BagError(`Conflicting payload paths: ${parent} and ${entry.path}`);
-        directories.add(parent);
-      }
-      if (entry.directory && files.has(normalized)) throw new BagError(`Conflicting payload file and directory: ${entry.path}`);
-      seen.set(normalized, entry.path);
+      registerPayload(entry);
       if (entry.directory) {
-        directories.add(normalized);
         addDirectory(`${prefix}data/${entry.path}/`, entry.mtime, entry.mode);
         continue;
       }
-      files.add(normalized);
-      const hashers = getHashers(algorithms);
-      let bytes = 0n;
-      async function* hashed(): AsyncGenerator<Uint8Array> {
-        const source = await entry.open();
-        try {
-          for await (const chunk of source) {
-            signal.throwIfAborted();
-            if (!(chunk instanceof Uint8Array)) throw new TypeError('Payload sources must produce Uint8Array or Buffer chunks');
-            bytes += BigInt(chunk.length);
-            for (const h of Object.values(hashers)) h.update(chunk);
-            yield chunk;
-          }
-        } finally { if (source instanceof Readable) source.destroy(); }
-      }
-      await addEntry(`${prefix}data/${entry.path}`, hashed(), entry.mtime, entry.mode);
-      const hashes = Object.fromEntries(Object.entries(hashers).map(([a, h]) => [a, h.digest('hex')]));
+      const { bytes, hashes } = await addSource(entry, `${prefix}data/${entry.path}`);
       for (const a of algorithms) await manifests.get(a)!.handle.writeFile(`${hashes[a]}  ${encodeFilename(`data/${entry.path}`)}\n`);
       totalBytes += bytes;
       totalFiles++;
       await options.onProgress?.({ path: entry.path, bytes, hashes, totalBytes, totalFiles });
     }
     const tags: { name: string; hashes: Checksums }[] = [];
+    const registerTag = entryRegistry('tag', ['bagit.txt', 'bag-info.txt', 'data']);
+    for await (const entry of options.tagFiles ?? []) {
+      signal.throwIfAborted();
+      // Unlike payload paths (which start with data/), root tags can begin with
+      // whitespace or checksum-tool binary markers that manifest parsers strip.
+      if (/^[\s*]/.test(encodeFilename(entry.path))) throw new BagError(`Ambiguous BagIt tag filename: ${JSON.stringify(entry.path)}`);
+      // Reserve manifest namespaces, including algorithms not selected for this export.
+      const root = normalizeUnicode(entry.path).split('/')[0]!;
+      if (/^(?:tagmanifest|manifest)-.*\.txt$/.test(root)) throw new BagError(`Reserved tag-file path: ${entry.path}`);
+      registerTag(entry);
+      if (entry.directory) addDirectory(`${prefix}${entry.path}/`, entry.mtime, entry.mode);
+      else {
+        const { hashes } = await addSource(entry, prefix + entry.path);
+        tags.push({ name: entry.path, hashes });
+      }
+    }
     for (const a of algorithms) {
       const manifest = manifests.get(a)!;
       await manifest.handle.close();

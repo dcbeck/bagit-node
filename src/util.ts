@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:p
 import { BagError, BagValidationError, FileNormalizationConflict } from './errors.js';
 import type { BagInfo, BagInfoInput, Checksums } from './types.js';
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
 export const DEFAULT_CHECKSUMS: readonly string[] = Object.freeze(['sha256', 'sha512']);
 export const HASH_BLOCK_SIZE = 512 * 1024;
 export const BAG_DECLARATION = 'BagIt-Version: 1.0\nTag-File-Character-Encoding: UTF-8\n';

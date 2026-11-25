@@ -4,8 +4,8 @@ import { spawn } from 'node:child_process';
 import { cp, readFile, writeFile, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
-import { Bag, makeBag, makeTagManifests, folderToBagZip, CHECKSUM_ALGOS } from '../../dist/esm/index.js';
-import { fixture } from '../helpers.mjs';
+import { Bag, makeBag, makeTagManifests, folderToBagZip, createBagZipStreamFromEntries, CHECKSUM_ALGOS } from '../../dist/esm/index.js';
+import { collect, fixture } from '../helpers.mjs';
 
 const oracleScript = fileURLToPath(new URL('./oracle.py', import.meta.url));
 export async function oracle(request) {
@@ -53,6 +53,27 @@ test('stdlib zipfile extracts and Python validates a streaming ZIP64 bag', async
   const result = await oracle({ action: 'zip', path: join(output, 'bag.zip'), destination: extracted, bagName: 'export' });
   assert(result.valid);
   assert.equal(result.info['Payload-Oxum'], '25.3');
+});
+
+test('Python validates lazy root and nested tags with independent checksums', async t => {
+  const output = await fixture(t, {});
+  const extracted = await fixture(t, {});
+  const tags = {
+    'metadata.json': Buffer.from('{"id":123}'),
+    'metadata/description.json': Buffer.from('{"description":"Grüße ♡"}'),
+  };
+  async function* tagFiles() {
+    for (const [path, content] of Object.entries(tags)) yield { path, open: async () => [content] };
+  }
+  const path = join(output, 'bag.zip');
+  await writeFile(path, await collect(createBagZipStreamFromEntries([
+    { path: 'metadata.json', open: () => [Buffer.from('payload')] },
+  ], { bagName: 'export/bag', bagInfo: info, tagFiles: tagFiles() })));
+  const result = await oracle({ action: 'zip', path, destination: extracted, bagName: 'export/bag' });
+  assert(result.valid);
+  assert.equal(result.info['Payload-Oxum'], '7.1');
+  for (const [name, bytes] of Object.entries(tags)) assert.deepEqual(await readFile(join(extracted, 'export/bag', name)), bytes);
+  assert(await new Bag(join(extracted, 'export/bag')).validate());
 });
 
 test('Python and Node report the same checksum mismatch details', async t => {

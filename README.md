@@ -41,7 +41,7 @@ await bag.validate();
 
 This moves the folder's existing contents into `data/`, preserves directory permissions, and writes `bagit.txt`, `bag-info.txt`, payload manifests, and tag manifests. An existing `data/` becomes `data/data/`, matching Python. Empty payloads receive empty manifests and remain valid. The function never changes the process working directory.
 
-`Bagging-Date` defaults to the local calendar date. `Bag-Software-Agent` defaults to `bagit-node v1.0.0`. Both may be overridden. `Payload-Oxum` is always calculated from the payload. New bags use UTF-8.
+`Bagging-Date` defaults to the local calendar date. `Bag-Software-Agent` defaults to `bagit-node v1.1.0`. Both may be overridden. `Payload-Oxum` is always calculated from the payload. New bags use UTF-8.
 
 ## Open, inspect, validate, and save
 
@@ -132,24 +132,36 @@ await folderToBagZip('/exports/source', createWriteStream('/exports/source.bag.z
 
 `folderToBagitZip` is an alias for `folderToBagZip`.
 
-Each source file is opened once. Its bytes pass through incremental hashing, ZIP deflate compression, and the output stream with backpressure. SHA checksums cover the original bytes before compression. Payload manifests are appended after payload entries, then bag metadata, then tag manifests. ZIP64 supports files and offsets above 4 GiB and more than 65,535 entries.
+Each source file is opened once. Its bytes pass through incremental hashing, ZIP deflate compression, and the output stream with backpressure. Checksums cover the original bytes before compression. Custom tag files, when supplied, follow payload entries, then payload manifests, bag metadata, and tag manifests. ZIP64 supports files and offsets above 4 GiB and more than 65,535 entries.
 
-Payloads and the complete ZIP are never buffered or staged by the streaming APIs. Manifests are spooled to temporary files, removed on completion, cancellation, or failure. Memory holds stream buffers, ZIP central directory metadata, and filenames for duplicate/path checks; it grows with the number of entries, not their byte sizes. `tempDirectory` selects the spool location and must be outside a folder source. Directory exports preserve empty directories, ZIP timestamps, and Unix modes. `mtime` sets a fixed ZIP timestamp for reproducible exports. Yazl automatically uses ZIP64 when needed, so small archives remain compatible with ordinary ZIP readers.
+Payloads, custom tag files, and the complete ZIP are never buffered or staged by the streaming APIs. Payload manifests are spooled to temporary files, removed on completion, cancellation, or failure. Memory holds stream buffers, ZIP central directory metadata, and filenames/checksums for duplicate checks and tag manifests; it grows with the number of entries, not their byte sizes. `tempDirectory` selects the spool location and must be outside a folder source. Directory exports preserve empty directories, ZIP timestamps, and Unix modes. `mtime` sets a fixed ZIP timestamp for reproducible exports. Yazl automatically uses ZIP64 when needed, so small archives remain compatible with ordinary ZIP readers.
 
 Source changes detected while a file is read cause export to fail. Keep sources stable during export: this is not a filesystem snapshot. Symlinks resolving outside the source are rejected, and folder export rejects directory symlinks. Custom source iterables must honor cancellation during their own pending I/O.
 
 ## Pipe directly to Ceph / S3 multipart upload
 
-`createBagZipStream` returns a standard Node `Readable`, suitable for your existing multipart uploader. For example, if your application already uses the AWS SDK:
+`createBagZipStreamFromEntries` returns a standard Node `Readable`, suitable for your existing multipart uploader. Use `tagFiles` to keep an application's `metadata.json` at the bag root while streaming lazy payloads directly to S3 or Ceph. For example, if your application already uses the AWS SDK:
 
 ```ts
-import { createBagZipStream } from 'bagit-node';
+import { Readable } from 'node:stream';
+import { createBagZipStreamFromEntries } from 'bagit-node';
 import { Upload } from '@aws-sdk/lib-storage'; // application dependency, not a bagit-node dependency
 
 const controller = new AbortController();
-const body = createBagZipStream('/exports/source', {
+const metadata = { id: 'collection-123', description: 'Export metadata' };
+const payloadEntries = [
+  { path: 'images/original.tif', open: () => openOriginalImageStream() }, // application source
+];
+const body = createBagZipStreamFromEntries(payloadEntries, {
   signal: controller.signal,
   checksums: ['sha256', 'sha512'],
+  bagInfo: { 'Contact-Name': 'Exporter' },
+  tagFiles: [
+    {
+      path: 'metadata.json', // relative to the bag root
+      open: () => Readable.from([Buffer.from(JSON.stringify(metadata), 'utf8')]),
+    },
+  ],
 });
 
 const upload = new Upload({
@@ -173,7 +185,9 @@ try {
 }
 ```
 
-The uploader's queue adds its own multipart buffers. A content length is not known before streaming. The stream emits source, compression, and filesystem errors; use an error-aware consumer such as `pipeline` or your multipart uploader. A consumed stream cannot be replayed. To retry or generate a temporary ZIP fallback, call `createBagZipStream` or `folderToBagZip` again, reading the sources again.
+This writes `data/images/original.tif`, root `metadata.json`, `bagit.txt`, `bag-info.txt`, payload manifests, and tag manifests. For a folder source, pass the same options to `createBagZipStream('/exports/source', options)`.
+
+The uploader's queue adds its own multipart buffers. A content length is not known before streaming. The stream emits source, compression, and filesystem errors; use an error-aware consumer such as `pipeline` or your multipart uploader. A consumed stream cannot be replayed. To retry or generate a temporary ZIP fallback, call the export API again with fresh payload and tag-file iterables, and have every `open()` return a fresh stream or iterable. Recreate async generators for each attempt and keep sources stable across retries.
 
 ## Build a ZIP directly from application sources
 
@@ -200,9 +214,13 @@ const body = createBagZipStreamFromEntries(entries(), {
 // Pass body to your multipart uploader or pipeline(body, destination).
 ```
 
-`open()` is called lazily, once per entry, and returns a `Readable`, iterable, or async iterable of `Uint8Array`/`Buffer` chunks, or a promise for one. Only one payload is read at a time. Source lengths need not be known. Entries may set `mtime`, `mode`, and `directory: true` (with `open: () => []`) for empty directories. Progress callbacks are awaited after each completed payload.
+`open()` is called lazily, once per entry, and returns a `Readable`, iterable, or async iterable of `Uint8Array`/`Buffer` chunks, or a promise for one. Payloads and custom tag files are read sequentially, one source at a time, with backpressure. Source lengths need not be known. Entries may set `mtime`, `mode`, and `directory: true` (with `open: () => []`) for empty directories. Progress callbacks are awaited after each completed payload; tag files do not trigger them.
+
+`BagZipOptions.tagFiles?: Iterable<BagZipEntry> | AsyncIterable<BagZipEntry>` is supported by `createBagZipStreamFromEntries`, `createBagZipStream`, `folderToBagZip`, and its `folderToBagitZip` alias. Tag paths are relative to the bag root, support nested names such as `metadata/description.json`, and receive the optional `bagName` prefix in the ZIP. Every configured tagmanifest records their original-byte checksums. They are excluded from payload manifests, payload byte/file totals, and `Payload-Oxum`. Root `metadata.json` can coexist with payload `data/metadata.json`. Omitting `tagFiles` preserves the existing layout and behavior.
 
 Archive paths must be relative POSIX paths. Absolute paths, traversal, backslashes, duplicate paths, Unicode normalization collisions, and file/directory conflicts are rejected. CR/LF filenames are encoded in manifests. Literal `%0A`/`%0D` in names and trailing whitespace that cannot round-trip through Python's manifest parser are rejected by ZIP export.
+
+Custom tag paths follow the same rules and cannot occupy `data/`, `bagit.txt`, `bag-info.txt`, or root `manifest-*.txt` / `tagmanifest-*.txt` paths, including their descendants. Leading whitespace or `*` in a tag path is also rejected because manifest parsers strip it. Tag manifests never list themselves or other tag manifests. Cancellation or failure destroys active readable sources and removes temporary manifests. Application iterables must honor cancellation during their own pending I/O.
 
 ## Compatibility and verification
 
